@@ -1,0 +1,124 @@
+{
+  "$schema": "https://raw.githubusercontent.com/F5Networks/f5-appsvcs-extension/master/schema/latest/as3-schema-3.11.0-3.json",
+  "class": "AS3",
+  "declaration": {
+    "class": "ADC",
+    "id": "urn:uuid:ebefe1c6-9629-4339-885f-92492db94120",
+    "label": "Basic Declaration",
+    "openshift_AS3": {
+      "Shared": {
+        "class": "Application",
+        "https_ose_vserver": {
+          "layer4": "tcp",
+          "source": "0.0.0.0/0",
+          "translateServerAddress": true,
+          "translateServerPort": true,
+          "class": "Service_HTTPS",
+          "profileHTTP": { "bigip": "/Common/http" },
+          "profileTCP": { "bigip": "/Common/tcp" },
+          "virtualAddresses": ["172.16.3.5"],
+          "virtualPort": 443,
+          "snat": "auto",
+          "policyEndpoint": "/openshift_AS3/Shared/openshift_secure_routes",
+          "clientTLS": "https_ose_vserver_tls_client",
+          "serverTLS": "https_ose_vserver_tls_server",
+          "iRules": ["openshift_passthrough_irule"],
+          "redirect80": false
+        },
+        "https_ose_vserver_tls_client": {
+          "class": "TLS_Client",
+          "trustCA": { "use": "serverssl_ca_bundle" },
+          "validateCertificate": true
+        },
+        "https_ose_vserver_tls_server": {
+          "class": "TLS_Server",
+          "certificates": [
+            {
+              "certificate": "openshift_route_default_example_route_client_ssl"
+            }
+          ]
+        },
+        "openshift_default_nginx_deployment": {
+          "class": "Pool",
+          "loadBalancingMode": "round-robin"
+        },
+        "openshift_passthrough_irule": {
+          "class": "iRule",
+          "iRule": "\n\t\tproc select_ab_pool {pathdefault_pool } {\n\t\t\tset last_slash [string length $path]\n\t\t\tset ab_class \"/openshift_AS3/ab_deployment_dg\"\n\t\t\twhile {$last_slash\u003e= 0} {\n\t\t\t\tif {[class match $path equals $ab_class]} then {\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t\tset last_slash [string last \"/\" $path $last_slash]\n\t\t\t\tincr last_slash -1\n\t\t\t\tset path [string range $path 0 $last_slash]\n\t\t\t}\n\n\t\t\tif {$last_slash \u003e= 0} {\n\t\t\t\tset ab_rule [class match -value $path equals $ab_class]\n\t\t\t\tif {$ab_rule != \"\"} then {\n\t\t\t\t\tset weight_selection [expr {rand()}]\n\t\t\t\t\tset service_rules [split $ab_rule \";\"]\n\t\t\t\t\tforeach service_rule $service_rules {\n\t\t\t\t\t\tset fields [split$service_rule \",\"]\n\t\t\t\t\t\tset pool_name [lindex $fields 0]\n\t\t\t\t\t\tset weight [expr {double([lindex $fields 1])}]\n\t\t\t\t\t\tif{$weight_selection \u003c= $weight} then {\n\t\t\t\t\t\t\treturn $pool_name\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\t# If we had a match, but all weights were 0 then\n\t\t\t\t# retrun a 503 (Service Unavailable)\n\t\t\t\tHTTP::respond 503\n\t\t\t}\n\t\t\treturn $default_pool\n\t\t}\n\n\n\t\twhen CLIENT_ACCEPTED {\n\t\t\tTCP::collect\n\t\t}\n\n\t\twhen CLIENT_DATA {\n\t\t\t# Byte 0 is the content type.\n\t\t\t# Bytes 1-2 are the TLS version.\n\t\t\t# Bytes 3-4 are the TLS payload length.\n\t\t\t# Bytes 5-$tls_payload_len are the TLS payload.\n\t\t\tbinary scan [TCP::payload] cSS tls_content_type tls_version tls_payload_len\n\n\t\t\tswitch $tls_version {\n\t\t\t\t\"769\" -\n\t\t\t\t\"770\" -\n\t\t\t\t\"771\" {\n\t\t\t\t\t# Content type of 22 indicates the TLS payload contains a handshake.\n\t\t\t\t\tif { $tls_content_type == 22 } {\n\t\t\t\t\t\t# Byte 5 (the first byte of the handshake) indicates the handshake\n\t\t\t\t\t\t# record type, and a value of 1 signifies that the handshake record is\n\t\t\t\t\t\t# a ClientHello.\n\t\t\t\t\t\tbinary scan [TCP::payload] @5c tls_handshake_record_type\n\t\t\t\t\t\tif { $tls_handshake_record_type == 1 } {\n\t\t\t\t\t\t\t# Bytes 6-8 are the handshake length (which we ignore).\n\t\t\t\t\t\t\t# Bytes 9-10 are the TLS version (which we ignore).\n\t\t\t\t\t\t\t# Bytes 11-42 are random data (which we ignore).\n\n\t\t\t\t\t\t\t# Byte 43 is the session ID length.  Following this are three\n\t\t\t\t\t\t\t# variable-length fields which we shall skip over.\n\t\t\t\t\t\t\tset record_offset 43\n\n\t\t\t\t\t\t\t# Skip the session ID.\n\t\t\t\t\t\t\tbinary scan [TCP::payload] @${record_offset}c tls_session_id_len\n\t\t\t\t\t\t\tincr record_offset [expr {1 + $tls_session_id_len}]\n\n\t\t\t\t\t\t\t# Skip the cipher_suites field.\n\t\t\t\t\t\t\tbinary scan [TCP::payload] @${record_offset}S tls_cipher_suites_len\n\t\t\t\t\t\t\tincr record_offset [expr {2 + $tls_cipher_suites_len}]\n\n\t\t\t\t\t\t\t# Skip the compression_methods field.\n\t\t\t\t\t\t\tbinary scan [TCP::payload] @${record_offset}c tls_compression_methods_len\n\t\t\t\t\t\t\tincr record_offset [expr {1 + $tls_compression_methods_len}]\n\n\t\t\t\t\t\t\t# Get the number of extensions, and store the extensions.\n\t\t\t\t\t\t\tbinary scan [TCP::payload] @${record_offset}S tls_extensions_len\n\t\t\t\t\t\t\tincr record_offset 2\n\t\t\t\t\t\t\tbinary scan [TCP::payload] @${record_offset}a* tls_extensions\n\n\t\t\t\t\t\t\tfor { set extension_start 0 }\n\t\t\t\t\t\t\t\t\t{ $tls_extensions_len - $extension_start == abs($tls_extensions_len - $extension_start) }\n\t\t\t\t\t\t\t\t\t{ incr extension_start 4 } {\n\t\t\t\t\t\t\t\t# Bytes 0-1 of the extension are the extension type.\n\t\t\t\t\t\t\t\t# Bytes 2-3 of the extension are the extension length.\n\t\t\t\t\t\t\t\tbinary scan $tls_extensions @${extension_start}SS extension_type extension_len\n\n\t\t\t\t\t\t\t\t# Extension type 00 is the ServerName extension.\n\t\t\t\t\t\t\t\tif { $extension_type == \"00\" } {\n\t\t\t\t\t\t\t\t\t# Bytes 4-5 of the extension are the SNI length (we ignore this).\n\n\t\t\t\t\t\t\t\t\t# Byte 6 of the extension is the SNI type.\n\t\t\t\t\t\t\t\t\tset sni_type_offset [expr {$extension_start + 6}]\n\t\t\t\t\t\t\t\t\tbinary scan $tls_extensions @${sni_type_offset}S sni_type\n\n\t\t\t\t\t\t\t\t\t# Type 0 is host_name.\n\t\t\t\t\t\t\t\t\tif { $sni_type == \"0\" } {\n\t\t\t\t\t\t\t\t\t\t# Bytes 7-8 of the extension are the SNI data (host_name)\n\t\t\t\t\t\t\t\t\t\t# length.\n\t\t\t\t\t\t\t\t\t\tset sni_len_offset [expr {$extension_start + 7}]\n\t\t\t\t\t\t\t\t\t\tbinary scan $tls_extensions @${sni_len_offset}S sni_len\n\n\t\t\t\t\t\t\t\t\t\t# Bytes 9-$sni_len are the SNI data (host_name).\n\t\t\t\t\t\t\t\t\t\tset sni_start [expr {$extension_start + 9}]\n\t\t\t\t\t\t\t\t\t\tbinary scan $tls_extensions @${sni_start}A${sni_len} tls_servername\n\t\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\t}\n\n\t\t\t\t\t\t\t\tincr extension_start $extension_len\n\t\t\t\t\t\t\t}\n\n\t\t\t\t\t\t\tif { [info exists tls_servername] } {\n\t\t\t\t\t\t\t\tset servername_lower [string tolower $tls_servername]\n\t\t\t\t\t\t\t\tSSL::disable serverside\n\t\t\t\t\t\t\t\tset dflt_pool \"\"\n\t\t\t\t\t\t\t\tset passthru_class \"/openshift_AS3/ssl_passthrough_servername_dg\"\n\t\t\t\t\t\t\t\tset reencrypt_class \"/openshift_AS3/ssl_reencrypt_servername_dg\"\n\t\t\t\t\t\t\t\tif { [class exists $passthru_class] } {\n\t\t\t\t\t\t\t\t\tset dflt_pool [class match -value $servername_lower equals $passthru_class]\n\t\t\t\t\t\t\t\t\tif { not ($dflt_pool equals \"\") } {\n\t\t\t\t\t\t\t\t\t\tSSL::disable\n\t\t\t\t\t\t\t\t\t\tHTTP::disable\n\t\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\telseif { [class exists $reencrypt_class] } {\n\t\t\t\t\t\t\t\t\tset dflt_pool [class match -value $servername_lower equals $reencrypt_class]\n\t\t\t\t\t\t\t\t\tif { not ($dflt_pool equals \"\") } {\n\t\t\t\t\t\t\t\t\t\tSSL::enable serverside\n\t\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\tset ab_class \"/openshift_AS3/ab_deployment_dg\"\n\t\t\t\t\t\t\t\tif { not [class exists $ab_class] } {\n\t\t\t\t\t\t\t\t\tif { $dflt_pool == \"\" } then {\n\t\t\t\t\t\t\t\t\t\tlog local0.debug \"Failed to find pool for $servername_lower\"\n\t\t\t\t\t\t\t\t\t} else {\n\t\t\t\t\t\t\t\t\t\tpool $dflt_pool\n\t\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\t} else {\n\t\t\t\t\t\t\t\t\tset selected_pool [call select_ab_pool $servername_lower $dflt_pool]\n\t\t\t\t\t\t\t\t\tif { $selected_pool == \"\" } then {\n\t\t\t\t\t\t\t\t\t\tlog local0.debug \"Failed to find pool for $servername_lower\"\n\t\t\t\t\t\t\t\t\t}else {\n\t\t\t\t\t\t\t\t\t\tpool $selected_pool\n\t\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\n\t\t\tTCP::release\n\t\t}\n\n\t\twhen SERVER_CONNECTED {\n\t\t\tset svrssl_class \"/openshift_AS3/ssl_reencrypt_serverssl_dg\"\n\t\t\tif { [info exists servername_lower] and [class exists $svrssl_class] } {\n\t\t\t\tset profile [class match -value $servername_lower equals$svrssl_class]\n\t\t\t\tif { not ($profile equals \"\") } {\n\t\t\t\t\tSSL::profile $profile\n\t\t\t\t}\n\t\t\t}\n\t\t}"
+        },
+        "openshift_route_default_example_route_client_ssl": {
+          "class": "Certificate",
+          "certificate": "-----BEGIN CERTIFICATE-----\nMIIEnjCCAoYCCQDNzSYc8MrejjANBgkqhkiG9w0BAQUFADCBjTELMAkGA1UEBhMC\nSU4xEzARBgNVBAgMClRhbWlsIE5hZHUxEjAQBgNVBAcMCVRoYW5qYXZ1cjESMBAG\nA1UECgwJU3VyZW5kaGFyMR8wHQYDVQQDDBZTdXJlbmRoYXIgUmF2aWNoYW5kcmFu\nMSAwHgYJKoZIhvcNAQkBFhFtYWlsQHN1cmVuZGhhci5pbjAeFw0xOTA3MTUwOTA1\nMDNaFw0yMjA0MTAwOTA1MDNaMIGTMQswCQYDVQQGEwJJTjESMBAGA1UECAwJVGVs\nZW5nYW5hMRIwEAYDVQQHDAlIeWRlcmFiYWQxFDASBgNVBAoMC0Y1IE5ldHdvcmtz\nMQwwCgYDVQQLDANDSVMxGDAWBgNVBAMMD3d3dy5leGFtcGxlLmNvbTEeMBwGCSqG\nSIb3DQEJARYPd3d3QGV4YW1wbGUuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\nMIIBCgKCAQEAw2SxOFzIGKvoO5QTgU19mbyeukBOU7B9FhDiSozcMq9h1OmPFEkT\nqmXDR2Xax4Fh2MyStVmesFlToYgUH13e98ncAo9SqE+9jElFpmcQ6te38Dl/c6ih\nR957qrAnkO8600AWiOkjlRPOAxRZzhGz+6O1YAj5foY7uWByuu+XZJtK1wAKUacL\nl0nH7kSsnda81lhPxOFtGWsqgq9fcnP5mlqxT4by2BiM6A5qXzlgMoV0DUko/PDd\nQMUSCYJOR1Dr/+NXScKAZNmOvJaHiWLxcnjnxWIpnLrLYOwNW8NC1D5E8wgZHZs4\nIW3gijezFgOPX4Dafk6N3dpz8z3yp5R3JQIDAQABMA0GCSqGSIb3DQEBBQUAA4IC\nAQBRl9g1y739cUTrM3EXFbSt59P5nZRy80WNx0HJVwSbL9ym+gKzYbjsMuiVUaXq\np0kb47ugcA6jS0e4cRNLa3GhQ4dI6h7LQH8QIx+g5SC56oXQlvG2GxGQvJ5whGrQ\nLaTL5jVbZ5jVvPJkRN11dE1qdrbutILrrQTdWi3P1PMJRzQYBFEhJs3wd5QQbl4P\nJPKRD6di/Y8DMASEWqHNnzYe8ebkc+QxVdQDN6jEPE+asEQnX0pobkzbejFItQqo\n7/LdN3H53lJtTqRV8HOn/61DLdfqlD49zlKsNlBn1G9h8cP07sQ3izZNxZxLLxMK\njcZ1miLddsSGU3EUIUNFNa2qclSXECvzS4NsqR9q7GxR0g55h2au071nbCoZ7OcZ\n542Jc4inbTudIF0xD2ZToMSGhHr/8b5voUquj3DKgIOkPuqWsn8kryZ9JsQkG2r8\nilx2Tr82uIAWFZIe1qyzhKpdeNkcpzPKg/DJsJ0CtHMY6ENxp6Wh+it7AC15Z2Et\nFELH8r4ZR6QXmX2FmwMHJFgHmhHT1YI6h8btXhwYlEv32NGiVvPTiL564v4yHOhM\nfxknZFy12HL0EB6HnL63Ew9mn5JsviacZJj6Nzdx0iOC9yxTL8Ormd9tgfq48SFN\n3teJzgYQDnZ/11jMtQiPTv18tWxseELFcjsYLxckP9OkMQ==\n-----END CERTIFICATE-----\n",
+          "privateKey": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAw2SxOFzIGKvoO5QTgU19mbyeukBOU7B9FhDiSozcMq9h1OmP\nFEkTqmXDR2Xax4Fh2MyStVmesFlToYgUH13e98ncAo9SqE+9jElFpmcQ6te38Dl/\nc6ihR957qrAnkO8600AWiOkjlRPOAxRZzhGz+6O1YAj5foY7uWByuu+XZJtK1wAK\nUacLl0nH7kSsnda81lhPxOFtGWsqgq9fcnP5mlqxT4by2BiM6A5qXzlgMoV0DUko\n/PDdQMUSCYJOR1Dr/+NXScKAZNmOvJaHiWLxcnjnxWIpnLrLYOwNW8NC1D5E8wgZ\nHZs4IW3gijezFgOPX4Dafk6N3dpz8z3yp5R3JQIDAQABAoIBAEhr8u/kG9phJVOn\n387mTO6FpgN8wEtut/5MxcNCEH/M16MV6o1nRJ282DOHgh6+SukTcjE7hYDxqvjN\nOkAiB/mp3R0pyEZQP/5WTjWOMAwLZsboWOAimZzMzuOGJTQoJ5KTR4b5etHPpGUp\nztt9Xkuf8yMkUG1gDZT5Na0qDuAftNLhdekZNBnWzZ+xNmHqtX5w23H8G4fsgIP4\ncAkQK1Hyq8YN96ux38oYbeFjcjGHwX4MGZSCZoMRx0kCb2ilPhHY4uQLWTD8RCuu\nzbuIuE5z2JLINGbbn5tkPHYZvnBdz7Aksy5/UoQmDs+Wjeb4wXCvp48iaqD2rG1T\nbHFnokECgYEA8IaeZN4E5eO59SeWVRzq+MCPUgVXqV7Bg7TvmAliQU+d9W1AQ33N\nmmAW4TIVw31TgAuSWDuBYhbBjOROtTbDl91PVuNuUjB0wscqPxnJaJepceEOWR4q\nV4AAfhT2T4OJf7MrTR8edfdzQ88idleMSMvPiueFIUkO/LYLt8I9Q/ECgYEAz/bB\neoKpHzWB2rz/XSwSSrJY2SCTCImFANUYYRf7HCWI+vuqwSq/AcqvsUoLOBJ/E5Ke\nFam2cG46l7IsL0ZFvbO9vQEZr+ybzCjSRh0jhZitY1Y75ldBBCUr7sbAQYXsw1T1\nDc6tesTEnIYUPdA88v0HGvh400SiAyHWvpS9CnUCgYEA1kf4QQCS+IQDHWdhRP54\nT5itlnLwABJM8Jt3gMmLYYgev5HPWNFxJIFKoOHQBdNXWpH0lOqef9aqJG0ZudPK\nOTePAWeo10wYGZb6CjFc//Ntn+jSsY5wRnfg+HKQZZJYIw5qG1EIACyt4dFdcHTa\no9f/VE6iil7eHUHJ+rHvhuECgYADeLUGHIRCNxxx0FHa9k9f29ZL2ZVawSDtQKFl\njYbtk1rUBbt1+gayOvXv2bKSPwzMANiOuASJn+1udtTx/RRQ9F0oeIo7O5HmOJA6\nB2Z+ZmwOinP5hl9ZeF1hYQP4lAm9wP9OObL/p6U4j6xq070QuVSTCK7LqAukTb5N\n9CGruQKBgQCHyXh5k7mWs3SvAVWu9TsroriIAhWg3VtuYCbuFWfyCYvBjNxr1pFl\nNZiMzDhHAYchMn4U2hN9y+6CCD7eIBOZjjoKQJN7D1JTF5KTElkmquI9vya+dc4s\nH/EhZFly6lgvZ83bm5p/tb72Eql7KVBxqSGJkdr9NEqBdPfVPeOdeg==\n-----END RSA PRIVATE KEY-----\n",
+          "chainCA": ""
+        },
+        "openshift_secure_routes": {
+          "class": "Endpoint_Policy",
+          "rules": [
+            {
+              "name": "openshift_route_default_example_route",
+              "conditions": [
+                {
+                  "type": "httpHeader",
+                  "name": "host",
+                  "event": "request",
+                  "all": { "values": ["www.example.com"], "operand": "equals" }
+                }
+              ],
+              "actions": [
+                {
+                  "type": "forward",
+                  "event": "request",
+                  "select": {
+                    "pool": { "use": "openshift_default_nginx_deployment" }
+                  }
+                }
+              ]
+            }
+          ],
+          "strategy": "first-match"
+        },
+        "ose_vserver": {
+          "layer4": "tcp",
+          "source": "0.0.0.0/0",
+          "translateServerAddress": true,
+          "translateServerPort": true,
+          "class": "Service_HTTP",
+          "profileHTTP": { "bigip": "/Common/http" },
+          "profileTCP": { "bigip": "/Common/tcp" },
+          "virtualAddresses": ["172.16.3.5"],
+          "virtualPort": 80,
+          "snat": "auto"
+        },
+        "serverssl_ca_bundle": {
+          "class": "CA_Bundle",
+          "bundle": "\n-----BEGIN CERTIFICATE-----\nMIIFmDCCA4ACCQDuuFnZhpzw9zANBgkqhkiG9w0BAQsFADCBjTELMAkGA1UEBhMC\nSU4xEzARBgNVBAgMClRhbWlsIE5hZHUxEjAQBgNVBAcMCVRoYW5qYXZ1cjESMBAG\nA1UECgwJU3VyZW5kaGFyMR8wHQYDVQQDDBZTdXJlbmRoYXIgUmF2aWNoYW5kcmFu\nMSAwHgYJKoZIhvcNAQkBFhFtYWlsQHN1cmVuZGhhci5pbjAeFw0xOTA1MDgwODQy\nNDNaFw0yOTA1MDUwODQyNDNaMIGNMQswCQYDVQQGEwJJTjETMBEGA1UECAwKVGFt\naWwgTmFkdTESMBAGA1UEBwwJVGhhbmphdnVyMRIwEAYDVQQKDAlTdXJlbmRoYXIx\nHzAdBgNVBAMMFlN1cmVuZGhhciBSYXZpY2hhbmRyYW4xIDAeBgkqhkiG9w0BCQEW\nEW1haWxAc3VyZW5kaGFyLmluMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKC\nAgEAxcWMTRN74R/eJxmx0AqFF+dMqj2PgQnKxRnaGm5sEsERK+QWUpSqQ5IJcLeH\nO4KeT3ZsR/COntrzc0trQOH2uevsFA2rSO1Y+aEbIvTTHWeftgK43Dgqds3WfjFr\ngI/kMUaG6vBIVnER2MsNxX5ud0k0YFnj/AKAmWT5VqQbKc9GhJDE6pfTlCCNehko\nEZj7huWvFXOVzUrSrroY8wx750l8l/GvErj38T7cC/BljakTu48BEtZHu/ko4q0R\njgNGsNC2/6QeWB0Ma0BiiDU9mVv0sbR/7s+VvbdVcRwKrYK4gR0xXMJ1BdgDZByw\ncYtRaXoQNonCcuQ5AeLXCoGmqT/bukJE2kcmL6+gIw1ksBF9XKyV9ZYvk+wshO+I\nrjX7QpOfnM9oF5PpkgWtiFssSlvAHsKfHNIu9v4MXuqvYtyWZWg6MWSXmRnAU5ZE\nsJUzB537X+rgx3hQUlMk6GosCPj+pKFfK9dD5e3YaSHuJSvqyNIBE5FtmdnizV7Y\ndS5NrQAFqfUwbUc+wBlwXksG+Xcy1BhG70ev3/Ee86APIIcUPxfhVW0HGGViGWDd\ngYUydsPPU2tZUqpewOUTFnW87k/NzDPC+TxfmAXQrszxBwbJWw8e+iV9U+nAiq6H\nXZTCfANd0EzyxyQPIKEC0p5rTGJHATQ09Y7yW4Se+skb82cCAwEAATANBgkqhkiG\n9w0BAQsFAAOCAgEAgrJHjKVVzorlqMeMzqNbEr+qLA9LbaT3dMrxgYlFd6Ue9TrD\nFrgLIBqeTS5AlZzV5Z5zifOUMjb/BIwpqUzjXOjyFawZsGgMlPI4Ow02zoNsslfk\nSfpd+x+r3sTxOSQ5OalFV5SIg/c+sJqSkZMuwxwD9GPjL54IndZFb0k+vY/NtDtY\n3J5oQz6riu9QywyS3RhDSe0/pTzA5U8nkowx/yM5Fx/lbdPqrXV9CqkkpO+i4Qlo\ncawFZqW0bR0FjoUmnpU8eiUiBWF+M9JeuVMVHf1gTS0RKsXh1VfJtPDrylKWldI5\nXzxAuuzseoBQ9X8eoIoVk2+9oAi/T7UK5HhsLU6d2NVhJAVCr+RRVbYPN4sFhPvk\nu68SIWJErgheUPr8L7BGvsxw2bpJZMLZRGqzNmOyeQnOLckaxWaQPa2bpJAaw7C8\n1eKY3gOgDMTx905z30k2Pn0t4TrWpMs9ttZjBx7rXv6efgOUpnD53dbRAROekdal\nNDIlT8GvChn+QOFnRpXsWGDC2cZks2AIoqI2KjAqLaA6slqdOtvXWv+VJmV13wIa\nUD2bJ+albxmbmFY/lmJOwFIQLeWN817J0y16TXqg0zgzUpfO1ov7S+Ye6sUTq4xj\nrYi0zW5wqHFzI7UBMkFiY0oaHpuimcKPMTG/TgA5bIR3hhGdrzaCuKOsaRU=\n-----END CERTIFICATE-----\n"
+        },
+        "ssl_reencrypt_servername_dg": {
+          "records": [
+            {
+              "key": "www.example.com",
+              "value": "openshift_default_nginx_deployment"
+            }
+          ],
+          "keyDataType": "string",
+          "class": "Data_Group"
+        },
+        "ssl_reencrypt_serverssl_dg": {
+          "records": [
+            {
+              "key": "www.example.com",
+              "value": "/openshift_AS3/openshift_route_default_example_route_server_ssl"
+            }
+          ],
+          "keyDataType": "string",
+          "class": "Data_Group"
+        },
+        "template": "shared"
+      },
+      "class": "Tenant"
+    },
+    "remark": "Default AS3 template",
+    "schemaVersion": "3.11.0"
+  }
+}
